@@ -1,0 +1,1110 @@
+*****************************************************************
+* IEEE 754 double precision arithmetic for cc9 (6309)           *
+* round to nearest even, results are bit exact                  *
+*                                                               *
+* calling convention (stack based, used by the compiler):       *
+*   binary ops : stack = ret, b(8), a(8) -> a = a op b, b popped *
+*   compare    : stack = ret, b(8), a(8) -> D = -1/0/1/2 (NaN)  *
+*   double->int: stack = ret, a(8)       -> Q, a popped          *
+*   int->double: Q = value               -> double pushed       *
+*                                                               *
+* internal (unpacked) format, 11 bytes:                         *
+*   0: sign ($00/$80)  1-2: biased exponent  3-10: mantissa     *
+*   the leading 1 of a normalized mantissa is bit 62            *
+*   value = M * 2^(E-1085)                                      *
+* The routines use static work areas: not reentrant.            *
+*****************************************************************
+*===== fpcore
+FPA     RMB     11              ; operand a / result
+FPB     RMB     11              ; operand b
+FPQ     RMB     11              ; quotient / temp
+FPT     RMB     16              ; 128 bit product
+fp_ca   RMB     1               ; class of a: 0 zero 1 finite 2 inf 3 nan
+fp_cb   RMB     1
+fp_cnt  RMB     1
+fp_stk  RMB     1               ; sticky bits
+fp_ze   RMB     2
+fp_rb   RMB     2
+fp_i    RMB     1
+fp_j    RMB     1
+
+******************************************************
+* unpack double at X into work area at Y             *
+* returns B = class                                  *
+******************************************************
+fp_unpack
+        LDA     ,X
+        ANDA    #$80
+        STA     ,Y
+        LDD     ,X
+        ANDA    #$7F
+        LSRD
+        LSRD
+        LSRD
+        LSRD
+        STD     1,Y
+        LDA     1,X
+        ANDA    #$0F
+        STA     3,Y
+        LDD     2,X
+        STD     4,Y
+        LDD     4,X
+        STD     6,Y
+        LDD     6,X
+        STD     8,Y
+        CLR     10,Y
+        JSR     fp_shl1
+        JSR     fp_shl1         ; fraction now at bits 61..10
+        LDD     1,Y
+        CMPD    #$7FF
+        BNE     fp_up1
+        JSR     fp_mzero        ; inf or nan
+        BEQ     fp_up_inf
+        LDB     #3
+        RTS
+fp_up_inf
+        LDB     #2
+        RTS
+fp_up1  CMPD    #0
+        BEQ     fp_up2
+        LDA     3,Y
+        ORA     #$40            ; implicit bit
+        STA     3,Y
+        LDB     #1
+        RTS
+fp_up2  JSR     fp_mzero
+        BNE     fp_up3
+        CLRB                    ; zero
+        RTS
+fp_up3  LDD     #1              ; subnormal: exponent 1, normalize
+        STD     1,Y
+        JSR     fp_norm
+        LDB     #1
+        RTS
+
+* Z = 1 if mantissa at Y is zero
+fp_mzero
+        LDQ     3,Y
+        ORR     W,D
+        BNE     fp_mz1
+        LDQ     7,Y
+        ORR     W,D
+fp_mz1  RTS
+
+* M <<= 1 (carry = bit shifted out)
+fp_shl1 LDQ     7,Y
+        ADDR    W,W
+        ADCR    D,D
+        STQ     7,Y
+        LDQ     3,Y
+        ADCR    W,W
+        ADCR    D,D
+        STQ     3,Y
+        RTS
+
+* M >>= 1 (carry = bit shifted out)
+fp_shr1 LDQ     3,Y
+        LSRD
+        RORW
+        STQ     3,Y
+        LDQ     7,Y
+        RORD
+        RORW
+        STQ     7,Y
+        RTS
+
+* M >>= 8
+fp_shr8 LDD     8,Y
+        STD     9,Y
+        LDD     6,Y
+        STD     7,Y
+        LDD     4,Y
+        STD     5,Y
+        LDA     3,Y
+        STA     4,Y
+        CLR     3,Y
+        RTS
+
+* M <<= 8
+fp_shl8 LDD     4,Y
+        STD     3,Y
+        LDD     6,Y
+        STD     5,Y
+        LDD     8,Y
+        STD     7,Y
+        LDA     10,Y
+        STA     9,Y
+        CLR     10,Y
+        RTS
+
+* normalize M (M != 0, bit 63 clear) so that bit 62 is set
+fp_norm LDA     3,Y
+        BNE     fp_nm2
+        LDA     4,Y
+        BMI     fp_nm2
+        JSR     fp_shl8
+        LDD     1,Y
+        SUBD    #8
+        STD     1,Y
+        BRA     fp_norm
+fp_nm2  LDA     3,Y
+        BITA    #$40
+        BNE     fp_nm3
+        JSR     fp_shl1
+        LDD     1,Y
+        SUBD    #1
+        STD     1,Y
+        BRA     fp_nm2
+fp_nm3  RTS
+
+* M >>= D with sticky bit (jamming)
+fp_shrj CLR     fp_stk
+        CMPD    #64
+        BLO     fp_sj1
+        JSR     fp_mzero
+        BEQ     fp_sj0
+        LDA     #1
+fp_sj0  CLRB
+        STB     3,Y
+        STB     4,Y
+        STB     5,Y
+        STB     6,Y
+        STB     7,Y
+        STB     8,Y
+        STB     9,Y
+        STA     10,Y
+        RTS
+fp_sj1  STB     fp_cnt
+fp_sj2  LDB     fp_cnt
+        CMPB    #8
+        BLO     fp_sj3
+        LDA     10,Y
+        ORA     fp_stk
+        STA     fp_stk
+        JSR     fp_shr8
+        LDB     fp_cnt
+        SUBB    #8
+        STB     fp_cnt
+        BRA     fp_sj2
+fp_sj3  TSTB
+        BEQ     fp_sj5
+fp_sj4  JSR     fp_shr1
+        BCC     fp_sj6
+        LDA     #1
+        STA     fp_stk
+fp_sj6  DEC     fp_cnt
+        BNE     fp_sj4
+fp_sj5  TST     fp_stk
+        BEQ     fp_sj7
+        LDA     10,Y
+        ORA     #1
+        STA     10,Y
+fp_sj7  RTS
+
+* M >>= D (D < 64), no sticky bit
+fp_shrn STB     fp_cnt
+fp_sn1  LDB     fp_cnt
+        CMPB    #8
+        BLO     fp_sn2
+        JSR     fp_shr8
+        LDB     fp_cnt
+        SUBB    #8
+        STB     fp_cnt
+        BRA     fp_sn1
+fp_sn2  TSTB
+        BEQ     fp_sn4
+fp_sn3  JSR     fp_shr1
+        DEC     fp_cnt
+        BNE     fp_sn3
+fp_sn4  RTS
+
+******************************************************
+* round and pack work area Y into double at X        *
+******************************************************
+fp_pack PSHS    X
+        LDD     1,Y
+        SUBD    #1
+        STD     fp_ze
+        BPL     fp_pk1
+        NEGD                    ; zExp < 0: denormalize
+        JSR     fp_shrj
+        CLRD
+        STD     fp_ze
+fp_pk1  LDD     fp_ze
+        CMPD    #$7FE
+        BGT     fp_pk_inf
+        LDD     9,Y
+        ANDD    #$3FF
+        STD     fp_rb
+        LDD     9,Y             ; M += $200
+        ADDD    #$200
+        STD     9,Y
+        LDD     7,Y
+        ADCD    #0
+        STD     7,Y
+        LDD     5,Y
+        ADCD    #0
+        STD     5,Y
+        LDD     3,Y
+        ADCD    #0
+        STD     3,Y
+        JSR     fp_shr8         ; M >>= 10
+        JSR     fp_shr1
+        JSR     fp_shr1
+        LDD     fp_rb
+        CMPD    #$200
+        BNE     fp_pk2
+        LDA     10,Y            ; tie: round to even
+        ANDA    #$FE
+        STA     10,Y
+fp_pk2  JSR     fp_mzero
+        BNE     fp_pk3
+        CLRD
+        STD     fp_ze
+fp_pk3  LDD     fp_ze           ; high word = (M >> 48) + (zExp << 4)
+        LSLD
+        LSLD
+        LSLD
+        LSLD
+        ADDD    3,Y
+        CMPD    #$7FF0
+        BHS     fp_pk_inf
+        ORA     ,Y              ; sign
+        PULS    X
+        STD     ,X
+        LDD     5,Y
+        STD     2,X
+        LDD     7,Y
+        STD     4,X
+        LDD     9,Y
+        STD     6,X
+        RTS
+fp_pk_inf
+        PULS    X
+        LDA     ,Y
+* store infinity with sign A at X
+fp_inf  ORA     #$7F
+        LDB     #$F0
+        STD     ,X
+        CLRD
+        STD     2,X
+        STD     4,X
+        STD     6,X
+        RTS
+* store NaN at X
+fp_nan  LDD     #$7FF8
+        STD     ,X
+        CLRD
+        STD     2,X
+        STD     4,X
+        STD     6,X
+        RTS
+* store zero with sign A at X
+fp_zero CLRB
+        STD     ,X
+        CLRD
+        STD     2,X
+        STD     4,X
+        STD     6,X
+        RTS
+
+* unpack both operands: a at X, b at U2 (passed in Y as pointer)
+fp_unpack2
+        PSHS    Y
+        LDY     #FPA
+        JSR     fp_unpack
+        STB     fp_ca
+        PULS    X
+        LDY     #FPB
+        JSR     fp_unpack
+        STB     fp_cb
+        RTS
+
+* copy 8 bytes from Y to X
+fp_copy LDD     ,Y
+        STD     ,X
+        LDD     2,Y
+        STD     2,X
+        LDD     4,Y
+        STD     4,X
+        LDD     6,Y
+        STD     6,X
+        RTS
+
+*===== fpadd
+* subtraction: negate b and add
+___dsub_s
+        LDA     2,S
+        EORA    #$80
+        STA     2,S
+* addition
+___dadd_s
+        LEAX    10,S
+        LEAY    2,S
+        JSR     fp_unpack2
+        LEAX    10,S            ; result -> a
+        LDA     fp_ca
+        CMPA    #3
+        BEQ     fp_ad_nan
+        LDB     fp_cb
+        CMPB    #3
+        BEQ     fp_ad_nan
+        CMPA    #2
+        BNE     fp_ad1
+        CMPB    #2              ; inf + inf
+        BNE     fp_ad_ret       ; result a
+        LDA     FPA
+        CMPA    FPB
+        BEQ     fp_ad_ret
+fp_ad_nan
+        JSR     fp_nan
+        BRA     fp_ad_ret
+fp_ad1  CMPB    #2
+        BEQ     fp_ad_b         ; finite + inf = b
+        TSTA
+        BNE     fp_ad2
+        TSTB
+        BNE     fp_ad_b         ; 0 + b = b
+        LDA     FPA             ; 0 + 0: sign = sa & sb
+        ANDA    FPB
+        JSR     fp_zero
+        BRA     fp_ad_ret
+fp_ad2  TSTB
+        BEQ     fp_ad_ret       ; a + 0 = a
+        JSR     fp_addcore
+        LEAX    10,S
+        LDY     #FPA
+        JSR     fp_pack
+        BRA     fp_ad_ret
+fp_ad_b LEAY    2,S
+        JSR     fp_copy
+fp_ad_ret
+        PULS    X
+        LEAS    8,S
+        JMP     ,X
+
+* |a| +- |b| on FPA, FPB (both finite, nonzero); result in FPA
+fp_addcore
+        LDD     FPA+1           ; compare magnitudes
+        CMPD    FPB+1
+        BGT     fp_ac2
+        BLT     fp_ac1
+        LDD     FPA+3
+        CMPD    FPB+3
+        BHI     fp_ac2
+        BLO     fp_ac1
+        LDD     FPA+5
+        CMPD    FPB+5
+        BHI     fp_ac2
+        BLO     fp_ac1
+        LDD     FPA+7
+        CMPD    FPB+7
+        BHI     fp_ac2
+        BLO     fp_ac1
+        LDD     FPA+9
+        CMPD    FPB+9
+        BHS     fp_ac2
+fp_ac1  LDX     #FPA            ; swap: |a| < |b|
+        LDY     #FPB
+        LDB     #11
+fp_acs  LDA     ,X
+        PSHS    A
+        LDA     ,Y
+        STA     ,X+
+        PULS    A
+        STA     ,Y+
+        DECB
+        BNE     fp_acs
+fp_ac2  LDD     FPA+1           ; align b
+        SUBD    FPB+1
+        LDY     #FPB
+        JSR     fp_shrj
+        LDA     FPA
+        CMPA    FPB
+        BNE     fp_ac_sub
+        LDD     FPA+9           ; FPA.M += FPB.M
+        ADDD    FPB+9
+        STD     FPA+9
+        LDD     FPA+7
+        ADCD    FPB+7
+        STD     FPA+7
+        LDD     FPA+5
+        ADCD    FPB+5
+        STD     FPA+5
+        LDD     FPA+3
+        ADCD    FPB+3
+        STD     FPA+3
+        BPL     fp_ac3          ; bit 63 clear
+        LDY     #FPA
+        JSR     fp_shr1
+        BCC     fp_ac4
+        LDA     FPA+10
+        ORA     #1
+        STA     FPA+10
+fp_ac4  LDD     FPA+1
+        ADDD    #1
+        STD     FPA+1
+fp_ac3  RTS
+fp_ac_sub
+        LDD     FPA+9           ; FPA.M -= FPB.M
+        SUBD    FPB+9
+        STD     FPA+9
+        LDD     FPA+7
+        SBCD    FPB+7
+        STD     FPA+7
+        LDD     FPA+5
+        SBCD    FPB+5
+        STD     FPA+5
+        LDD     FPA+3
+        SBCD    FPB+3
+        STD     FPA+3
+        LDY     #FPA
+        JSR     fp_mzero
+        BNE     fp_ac5
+        CLR     FPA             ; exact zero: +0
+        CLRD
+        STD     FPA+1
+        RTS
+fp_ac5  JMP     fp_norm
+
+*===== fpmul
+___dmul_s
+        LEAX    10,S
+        LEAY    2,S
+        JSR     fp_unpack2
+        LEAX    10,S
+        LDA     FPA
+        EORA    FPB
+        STA     FPA             ; result sign
+        LDA     fp_ca
+        LDB     fp_cb
+        CMPA    #3
+        BEQ     fp_mu_nan
+        CMPB    #3
+        BEQ     fp_mu_nan
+        CMPA    #2
+        BEQ     fp_mu_ia
+        CMPB    #2
+        BEQ     fp_mu_ib
+        TSTA
+        BEQ     fp_mu_z
+        TSTB
+        BEQ     fp_mu_z
+        LDD     FPA+1           ; E = Ea + Eb - 1023
+        ADDD    FPB+1
+        SUBD    #1023
+        STD     FPA+1
+        LDY     #FPA
+        JSR     fp_shl1
+        LDY     #FPB
+        JSR     fp_shl1
+        LDX     #FPT            ; clear product
+        CLRD
+        STD     ,X
+        STD     2,X
+        STD     4,X
+        STD     6,X
+        STD     8,X
+        STD     10,X
+        STD     12,X
+        STD     14,X
+        LDA     #6
+        STA     fp_i
+fp_mu1  LDX     #FPA+3          ; E = a[i]
+        LDB     fp_i
+        ABX
+        LDE     ,X
+        BEQ     fp_mu4
+        LDX     #FPT+6          ; X = &P[i+6], Y = &b[6]
+        ABX
+        LDY     #FPB+9
+        LDF     #7
+fp_mu2  LDB     ,Y
+        BEQ     fp_mu3
+        TFR     E,A
+        MUL
+        ADDD    ,X
+        STD     ,X
+        BCC     fp_mu3
+        PSHS    X
+fp_mc1  LEAX    -1,X            ; propagate carry
+        INC     ,X
+        BEQ     fp_mc1
+        PULS    X
+fp_mu3  LEAX    -1,X
+        LEAY    -1,Y
+        DECF
+        BNE     fp_mu2
+fp_mu4  DEC     fp_i
+        BPL     fp_mu1
+        LDX     #FPT            ; M = high 64 bits, sticky = low 64 bits
+        LDD     ,X
+        STD     FPA+3
+        LDD     2,X
+        STD     FPA+5
+        LDD     4,X
+        STD     FPA+7
+        LDD     6,X
+        STD     FPA+9
+        LDD     8,X
+        ORD     10,X
+        ORD     12,X
+        ORD     14,X
+        BEQ     fp_mu5
+        LDA     FPA+10
+        ORA     #1
+        STA     FPA+10
+fp_mu5  LDA     FPA+3
+        BPL     fp_mu6
+        LDY     #FPA
+        JSR     fp_shr1
+        BCC     fp_mu7
+        LDA     FPA+10
+        ORA     #1
+        STA     FPA+10
+fp_mu7  LDD     FPA+1
+        ADDD    #1
+        STD     FPA+1
+fp_mu6  LEAX    10,S
+        LDY     #FPA
+        JSR     fp_pack
+        BRA     fp_mu_ret
+fp_mu_ia
+        TSTB                    ; inf * 0 = nan
+        BEQ     fp_mu_nan
+        BRA     fp_mu_inf
+fp_mu_ib
+        TSTA
+        BEQ     fp_mu_nan
+fp_mu_inf
+        LDA     FPA
+        JSR     fp_inf
+        BRA     fp_mu_ret
+fp_mu_z LDA     FPA
+        JSR     fp_zero
+        BRA     fp_mu_ret
+fp_mu_nan
+        JSR     fp_nan
+fp_mu_ret
+        PULS    X
+        LEAS    8,S
+        JMP     ,X
+
+*===== fpdiv
+___ddiv_s
+        LEAX    10,S
+        LEAY    2,S
+        JSR     fp_unpack2
+        LEAX    10,S
+        LDA     FPA
+        EORA    FPB
+        STA     FPA
+        LDA     fp_ca
+        LDB     fp_cb
+        CMPA    #3
+        BEQ     fp_dv_nan
+        CMPB    #3
+        BEQ     fp_dv_nan
+        CMPA    #2
+        BNE     fp_dv1
+        CMPB    #2              ; inf / inf
+        BEQ     fp_dv_nan
+        BRA     fp_dv_inf
+fp_dv1  CMPB    #2
+        BEQ     fp_dv_z         ; x / inf = 0
+        TSTB
+        BNE     fp_dv2
+        TSTA                    ; x / 0
+        BEQ     fp_dv_nan
+        BRA     fp_dv_inf
+fp_dv2  TSTA
+        BEQ     fp_dv_z
+        LDD     FPA+1           ; E = Ea - Eb + 1023
+        SUBD    FPB+1
+        ADDD    #1023
+        STD     FPA+1
+        JSR     fp_cmpm         ; Ma < Mb ?
+        BHS     fp_dv3
+        LDY     #FPA
+        JSR     fp_shl1
+        LDD     FPA+1
+        SUBD    #1
+        STD     FPA+1
+fp_dv3  LDX     #FPQ            ; Q = 0
+        CLRD
+        STD     3,X
+        STD     5,X
+        STD     7,X
+        STD     9,X
+        LDA     #63
+        STA     fp_i
+fp_dv4  LDY     #FPQ
+        JSR     fp_shl1
+        JSR     fp_cmpm
+        BLO     fp_dv5
+        LDD     FPA+9           ; Ma -= Mb
+        SUBD    FPB+9
+        STD     FPA+9
+        LDD     FPA+7
+        SBCD    FPB+7
+        STD     FPA+7
+        LDD     FPA+5
+        SBCD    FPB+5
+        STD     FPA+5
+        LDD     FPA+3
+        SBCD    FPB+3
+        STD     FPA+3
+        LDA     FPQ+10
+        ORA     #1
+        STA     FPQ+10
+fp_dv5  LDY     #FPA
+        JSR     fp_shl1
+        DEC     fp_i
+        BNE     fp_dv4
+        JSR     fp_mzero        ; remainder != 0 -> sticky
+        BEQ     fp_dv6
+        LDA     FPQ+10
+        ORA     #1
+        STA     FPQ+10
+fp_dv6  LDD     FPQ+3
+        STD     FPA+3
+        LDD     FPQ+5
+        STD     FPA+5
+        LDD     FPQ+7
+        STD     FPA+7
+        LDD     FPQ+9
+        STD     FPA+9
+        LEAX    10,S
+        LDY     #FPA
+        JSR     fp_pack
+        BRA     fp_dv_ret
+fp_dv_inf
+        LDA     FPA
+        JSR     fp_inf
+        BRA     fp_dv_ret
+fp_dv_z LDA     FPA
+        JSR     fp_zero
+        BRA     fp_dv_ret
+fp_dv_nan
+        JSR     fp_nan
+fp_dv_ret
+        PULS    X
+        LEAS    8,S
+        JMP     ,X
+
+* compare FPA.M with FPB.M (unsigned), flags as CMP
+fp_cmpm LDD     FPA+3
+        CMPD    FPB+3
+        BNE     fp_cm1
+        LDD     FPA+5
+        CMPD    FPB+5
+        BNE     fp_cm1
+        LDD     FPA+7
+        CMPD    FPB+7
+        BNE     fp_cm1
+        LDD     FPA+9
+        CMPD    FPB+9
+fp_cm1  RTS
+
+*===== fpcmp
+* stack = ret, b(8), a(8) -> D = -1 (a<b), 0, 1, 2 (unordered)
+___dcmp_s
+        LEAX    10,S
+        BSR     fp_isnan
+        BNE     fp_cp_un
+        LEAX    2,S
+        BSR     fp_isnan
+        BNE     fp_cp_un
+        LDD     10,S            ; both zero?
+        ORD     2,S
+        ANDA    #$7F
+        ORD     12,S
+        ORD     14,S
+        ORD     16,S
+        ORD     4,S
+        ORD     6,S
+        ORD     8,S
+        BEQ     fp_cp_eq
+        LDA     10,S
+        EORA    2,S
+        BPL     fp_cp1          ; same sign
+        LDA     10,S
+        BMI     fp_cp_lt
+        BRA     fp_cp_gt
+fp_cp1  LDD     10,S            ; unsigned magnitude compare
+        CMPD    2,S
+        BNE     fp_cp2
+        LDD     12,S
+        CMPD    4,S
+        BNE     fp_cp2
+        LDD     14,S
+        CMPD    6,S
+        BNE     fp_cp2
+        LDD     16,S
+        CMPD    8,S
+        BEQ     fp_cp_eq
+fp_cp2  BLO     fp_cp3          ; |a| < |b|
+        LDA     10,S
+        BMI     fp_cp_lt
+        BRA     fp_cp_gt
+fp_cp3  LDA     10,S
+        BMI     fp_cp_gt
+fp_cp_lt
+        LDD     #-1
+        BRA     fp_cp_ret
+fp_cp_gt
+        LDD     #1
+        BRA     fp_cp_ret
+fp_cp_eq
+        CLRD
+        BRA     fp_cp_ret
+fp_cp_un
+        LDD     #2
+fp_cp_ret
+        PULS    X
+        LEAS    16,S
+        JMP     ,X
+
+* Z = 0 if double at X is a NaN
+fp_isnan
+        LDD     ,X
+        ANDA    #$7F
+        CMPD    #$7FF0
+        BLO     fp_in0
+        BHI     fp_in1
+        LDD     2,X
+        ORD     4,X
+        ORD     6,X
+        BNE     fp_in1
+        CLRD
+        RTS
+fp_in1  LDD     #1
+        RTS
+fp_in0  CLRD
+        RTS
+
+*===== fpd2l
+* stack = ret, a(8) -> Q = (long)a truncated, saturated on overflow
+___d2l_s
+        CLR     fp_j            ; signed
+        BRA     fp_d2i
+___d2ul_s
+        LDA     #1
+        STA     fp_j            ; unsigned
+fp_d2i  LEAX    2,S
+        LDY     #FPA
+        JSR     fp_unpack
+        CMPB    #2
+        BHS     fp_di_ovf
+        TSTB
+        BEQ     fp_di_z
+        LDD     FPA+1
+        SUBD    #1023
+        BLT     fp_di_z         ; |a| < 1
+        CMPD    #32
+        BHS     fp_di_ovf
+        STD     fp_ze           ; shift = 0..31
+        LDD     #62
+        SUBD    fp_ze
+        JSR     fp_shrn         ; integer part in low 32 bits
+        LDQ     FPA+7
+        TST     fp_j
+        BNE     fp_di_u
+        TSTA                    ; signed: magnitude > $7FFFFFFF?
+        BPL     fp_di_s1
+        TST     FPA
+        BPL     fp_di_ovf
+        CMPD    #$8000          ; only -2^31 allowed
+        BNE     fp_di_ovf
+        TSTW
+        BNE     fp_di_ovf
+        BRA     fp_di_ret
+fp_di_s1
+        TST     FPA
+        BPL     fp_di_ret
+fp_di_neg
+        COMD
+        COMW
+        ADDW    #1
+        ADCD    #0
+        BRA     fp_di_ret
+fp_di_u TST     FPA
+        BMI     fp_di_neg
+        BRA     fp_di_ret
+fp_di_ovf
+        TST     fp_j
+        BNE     fp_di_uo
+        LDA     FPA             ; signed saturation
+        BMI     fp_di_mn
+        LDD     #$7FFF
+        LDW     #$FFFF
+        BRA     fp_di_ret
+fp_di_mn
+        LDD     #$8000
+        CLRW
+        BRA     fp_di_ret
+fp_di_uo
+        LDA     FPA
+        BMI     fp_di_z
+        LDD     #$FFFF
+        LDW     #$FFFF
+        BRA     fp_di_ret
+fp_di_z CLRD
+        CLRW
+fp_di_ret
+        PULS    X
+        LEAS    8,S
+        JMP     ,X
+
+*===== fpl2d
+* Q = long -> double pushed
+___l2d_s
+        CLR     FPA
+        TSTA
+        BPL     fp_l2
+        OIM     #$80,FPA
+        COMD
+        COMW
+        ADDW    #1
+        ADCD    #0
+        BRA     fp_l2
+___ul2d_s
+        CLR     FPA
+fp_l2   STQ     FPA+3           ; M = value << 32
+        CLRD
+        STD     FPA+7
+        STD     FPA+9
+        PULS    X               ; return address
+        LEAS    -8,S
+        PSHS    X
+        LEAX    2,S
+        LDY     #FPA
+        JSR     fp_mzero
+        BNE     fp_l3
+        CLRA
+        JSR     fp_zero
+        PULS    X
+        JMP     ,X
+fp_l3   LDA     FPA+3           ; value >= 2^31: shift right once
+        BPL     fp_l4
+        JSR     fp_shr1
+        LDD     #1054
+        BRA     fp_l5
+fp_l4   LDD     #1053
+fp_l5   STD     FPA+1
+        JSR     fp_norm
+        LEAX    2,S
+        JSR     fp_pack
+        PULS    X
+        JMP     ,X
+
+*===== fpf2d
+* Q = float bits -> double pushed
+___f2d_s
+        STQ     FPQ             ; raw float
+        PULS    X
+        LEAS    -8,S
+        PSHS    X
+        LDA     FPQ
+        ANDA    #$80
+        STA     FPA
+        LDD     FPQ             ; exponent = bits 30..23
+        LSLD
+        TFR     A,B
+        CLRA
+        STD     FPA+1
+        LDA     FPQ+1           ; M = frac24 << 39
+        ORA     #$80
+        STA     FPA+3
+        LDD     FPQ+2
+        STD     FPA+4
+        CLRD
+        STD     FPA+6
+        STD     FPA+8
+        CLR     FPA+10
+        LDY     #FPA
+        JSR     fp_shr1
+        LEAX    2,S
+        LDD     FPA+1
+        CMPD    #255
+        BEQ     fp_fd_sp
+        TSTD
+        BEQ     fp_fd_sub
+        ADDD    #896            ; 1023 - 127
+        STD     FPA+1
+        JSR     fp_pack
+        PULS    X
+        JMP     ,X
+fp_fd_sub
+        LDA     FPA+3           ; no implicit bit
+        ANDA    #$BF
+        STA     FPA+3
+        JSR     fp_mzero
+        BNE     fp_fd1
+        LDA     FPA
+        JSR     fp_zero
+        PULS    X
+        JMP     ,X
+fp_fd1  LDD     #897
+        STD     FPA+1
+        JSR     fp_norm
+        LEAX    2,S
+        JSR     fp_pack
+        PULS    X
+        JMP     ,X
+fp_fd_sp
+        LDA     FPQ+1           ; inf or nan
+        ANDA    #$7F
+        ORA     FPQ+2
+        ORA     FPQ+3
+        BNE     fp_fd_nan
+        LDA     FPA
+        JSR     fp_inf
+        PULS    X
+        JMP     ,X
+fp_fd_nan
+        JSR     fp_nan
+        PULS    X
+        JMP     ,X
+
+*===== fpd2f
+* stack = ret, a(8) -> Q = float bits (round to nearest even)
+___d2f_s
+        LEAX    2,S
+        LDY     #FPA
+        JSR     fp_unpack
+        CMPB    #3
+        BEQ     fp_df_nan
+        CMPB    #2
+        BEQ     fp_df_inf
+        TSTB
+        BEQ     fp_df_z
+        LDD     FPA+1           ; zExp = E - 896 - 1
+        SUBD    #897
+        STD     fp_ze
+        LDD     FPA+7           ; sticky from the low 32 bits
+        ORD     FPA+9
+        BEQ     fp_df1
+        LDA     FPA+6
+        ORA     #1
+        STA     FPA+6
+fp_df1  LDD     fp_ze           ; sig32 = FPA+3..6, leading bit 30
+        BPL     fp_df2
+        NEGD                    ; denormalize
+        JSR     fp_shrj32
+        CLRD
+        STD     fp_ze
+fp_df2  LDD     fp_ze
+        CMPD    #$FE
+        BGT     fp_df_inf
+        LDB     FPA+6           ; round bits = sig & $7F
+        ANDB    #$7F
+        STB     fp_rb
+        LDD     FPA+5           ; sig += $40
+        ADDD    #$40
+        STD     FPA+5
+        LDD     FPA+3
+        ADCD    #0
+        STD     FPA+3
+        LDB     #7
+        STB     fp_cnt
+        LDQ     FPA+3           ; sig >>= 7
+fp_df3  LSRD
+        RORW
+        DEC     fp_cnt
+        BNE     fp_df3
+        STQ     FPQ
+        LDB     fp_rb
+        CMPB    #$40
+        BNE     fp_df4
+        LDA     FPQ+3           ; tie: even
+        ANDA    #$FE
+        STA     FPQ+3
+fp_df4  LDQ     FPQ
+        ORR     W,D
+        BNE     fp_df5
+        CLRD
+        STD     fp_ze
+fp_df5  LDD     fp_ze           ; + (zExp << 23): high word += zExp << 7
+        LSLD
+        LSLD
+        LSLD
+        LSLD
+        LSLD
+        LSLD
+        LSLD
+        ADDD    FPQ
+        CMPD    #$7F80
+        BHS     fp_df_inf
+        ORA     FPA
+        LDW     FPQ+2
+        BRA     fp_df_ret
+fp_df_inf
+        LDA     FPA
+        ORA     #$7F
+        LDB     #$80
+        CLRW
+        BRA     fp_df_ret
+fp_df_nan
+        LDD     #$7FC0
+        CLRW
+        BRA     fp_df_ret
+fp_df_z LDA     FPA
+        CLRB
+        CLRW
+fp_df_ret
+        PULS    X
+        LEAS    8,S
+        JMP     ,X
+
+* 32 bit sig at FPA+3..6 >>= D with jamming (D >= 1)
+fp_shrj32
+        CMPD    #32
+        BLO     fp_s32a
+        LDQ     FPA+3
+        ORR     W,D
+        BEQ     fp_s32z
+        CLRD
+        LDW     #1
+        STQ     FPA+3
+        RTS
+fp_s32z STQ     FPA+3
+        RTS
+fp_s32a STB     fp_cnt
+        CLR     fp_stk
+        LDQ     FPA+3
+fp_s32b LSRD
+        RORW
+        BCC     fp_s32c
+        INC     fp_stk
+fp_s32c DEC     fp_cnt
+        BNE     fp_s32b
+        STQ     FPA+3
+        TST     fp_stk
+        BEQ     fp_s32d
+        LDA     FPA+6
+        ORA     #1
+        STA     FPA+6
+fp_s32d RTS
+
+*===== dpush
+* push the double at X
+___dpush
+        PULS    Y
+        LDQ     4,X
+        PSHSW
+        PSHS    D
+        LDQ     ,X
+        PSHSW
+        PSHS    D
+        JMP     ,Y
+*===== dpop
+* pop a double to X
+___dpop PULS    Y
+        PULS    D
+        PULSW
+        STQ     ,X
+        PULS    D
+        PULSW
+        STQ     4,X
+        JMP     ,Y

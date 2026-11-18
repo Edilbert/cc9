@@ -1,0 +1,338 @@
+*****************************************************************
+* cc9 runtime for the Sparrow09 (6309)                          *
+* Units are separated by lines starting with *=====             *
+* only units that are referenced are linked into the program    *
+*****************************************************************
+*===== startup
+************************************************************
+* Program entry, called from BASIC with SYS                *
+* - saves the BASIC registers and stack pointer            *
+* - sets up the C stack, clears uninitialized data         *
+* - calls main(0, NULL) and exit()                         *
+************************************************************
+__start PSHS    U,Y,X,DP
+        STS     __savesp
+        LDS     #STACK_TOP
+        LDX     #__bss
+        LDW     #__end-__bss
+        BEQ     __st1
+__st0   CLR     ,X+
+        DECW
+        BNE     __st0
+__st1   CLRD
+        PSHS    D               ; argv = NULL
+        PSHS    D               ; argc = 0
+        JSR     _main
+        PSHS    D
+        JSR     _exit
+* void __exit(int status): return to BASIC
+___exit LDD     2,S
+        LDS     __savesp
+        PULS    U,Y,X,DP
+        RTS
+* char *__heap_base(void)
+___heap_base
+        LDD     #__end
+        RTS
+__savesp RMB    2
+*===== udiv16
+************************************************************
+* unsigned 16 bit division                                 *
+* input : D = dividend, X = divisor                        *
+* output: D = quotient, X = remainder                      *
+************************************************************
+___udiv16
+        PSHS    X               ; divisor at ,S
+        TFR     D,W             ; W = dividend -> quotient
+        CLRD                    ; D = remainder
+        LDX     #16
+__ud1   ADDR    W,W             ; shift dividend left, msb to carry
+        ADCR    D,D             ; remainder = 2 * remainder + carry
+        CMPD    ,S
+        BLO     __ud2
+        SUBD    ,S
+        INCW                    ; quotient bit = 1
+__ud2   LEAX    -1,X
+        BNE     __ud1
+        TFR     D,X             ; remainder
+        TFR     W,D             ; quotient
+        LEAS    2,S
+        RTS
+*===== lmul
+************************************************************
+* 32 bit multiplication  Q = Q * [2,S]                     *
+************************************************************
+___lmul PSHSW
+        PSHS    D               ; ,S=ah 2,S=al 4,S=ret 6,S=bh 8,S=bl
+        LDD     2,S
+        MULD    8,S             ; Q = al * bl (signed)
+        TST     2,S             ; correction for unsigned product
+        BPL     __lm1
+        ADDD    8,S
+__lm1   TST     8,S
+        BPL     __lm2
+        ADDD    2,S
+__lm2   PSHSW                   ; ,S=lo
+        PSHS    D               ; ,S=hi 2,S=lo 4,S=ah 6,S=al 8,S=ret 10,S=bh 12,S=bl
+        LDD     4,S
+        MULD    12,S            ; ah * bl
+        TFR     W,D
+        ADDD    ,S
+        STD     ,S
+        LDD     6,S
+        MULD    10,S            ; al * bh
+        TFR     W,D
+        ADDD    ,S
+        LDW     2,S
+        LEAS    8,S
+        RTS
+*===== udm32
+************************************************************
+* unsigned 32 bit division core                            *
+* input : Q = dividend, X -> divisor (4 bytes)             *
+* output: Q = quotient, remainder in __rem32               *
+************************************************************
+__udm32 PSHSW
+        PSHS    D               ; ,S = dividend / quotient
+        CLRD
+        CLRW                    ; remainder = 0
+        LDY     #32
+__dm1   ASL     3,S
+        ROL     2,S
+        ROL     1,S
+        ROL     ,S
+        ROLW
+        ROLD
+        BCS     __dm3           ; remainder overflowed 32 bit: subtract
+        CMPD    ,X
+        BHI     __dm3
+        BLO     __dm4
+        CMPW    2,X
+        BLO     __dm4
+__dm3   SUBW    2,X
+        SBCD    ,X
+        INC     3,S             ; quotient bit = 1
+__dm4   LEAY    -1,Y
+        BNE     __dm1
+        STQ     __rem32
+        PULS    D
+        PULSW
+        RTS
+__rem32 RMB     4
+*===== uldiv
+* unsigned long Q / [2,S]
+___uldiv
+        LEAX    2,S
+        JMP     __udm32
+*===== ulmod
+* unsigned long Q % [2,S]
+___ulmod
+        LEAX    2,S
+        JSR     __udm32
+        LDQ     __rem32
+        RTS
+*===== ldiv
+* signed long Q / [2,S], quotient truncated towards zero
+___ldiv CLR     ,-S             ; sign flag
+        TSTA
+        BPL     __ld1
+        COM     ,S
+        COMD
+        COMW
+        ADDW    #1
+        ADCD    #0
+__ld1   PSHSW
+        PSHS    D               ; ,S=|a| 4,S=flag 5,S=ret 7,S=b
+        LDQ     7,S
+        TSTA
+        BPL     __ld2
+        COM     4,S
+        COMD
+        COMW
+        ADDW    #1
+        ADCD    #0
+__ld2   PSHSW
+        PSHS    D               ; ,S=|b| 4,S=|a| 8,S=flag
+        LEAX    ,S
+        LDQ     4,S
+        JSR     __udm32
+        TST     8,S
+        BEQ     __ld3
+        COMD
+        COMW
+        ADDW    #1
+        ADCD    #0
+__ld3   LEAS    9,S
+        RTS
+*===== lmod
+* signed long Q % [2,S], sign of the result = sign of the dividend
+___lmod CLR     ,-S             ; sign flag
+        TSTA
+        BPL     __lo1
+        COM     ,S
+        COMD
+        COMW
+        ADDW    #1
+        ADCD    #0
+__lo1   PSHSW
+        PSHS    D               ; ,S=|a| 4,S=flag 5,S=ret 7,S=b
+        LDQ     7,S
+        TSTA
+        BPL     __lo2
+        COMD
+        COMW
+        ADDW    #1
+        ADCD    #0
+__lo2   PSHSW
+        PSHS    D               ; ,S=|b| 4,S=|a| 8,S=flag
+        LEAX    ,S
+        LDQ     4,S
+        JSR     __udm32
+        LDQ     __rem32
+        TST     8,S
+        BEQ     __lo3
+        COMD
+        COMW
+        ADDW    #1
+        ADCD    #0
+__lo3   LEAS    9,S
+        RTS
+*===== lshl
+* Q <<= [2,S]
+___lshl LDY     2,S
+        BEQ     __sl2
+__sl1   ADDR    W,W
+        ADCR    D,D
+        LEAY    -1,Y
+        BNE     __sl1
+__sl2   RTS
+*===== lshr
+* unsigned Q >>= [2,S]
+___lshr LDY     2,S
+        BEQ     __sr2
+__sr1   LSRD
+        RORW
+        LEAY    -1,Y
+        BNE     __sr1
+__sr2   RTS
+*===== lsar
+* signed Q >>= [2,S]
+___lsar LDY     2,S
+        BEQ     __sa2
+__sa1   ASRD
+        RORW
+        LEAY    -1,Y
+        BNE     __sa1
+__sa2   RTS
+*===== lcmp
+* compare signed Q with [2,S]: D = -1 / 0 / 1
+___lcmp CMPD    2,S
+        BLT     __lc1
+        BGT     __lc2
+        CMPW    4,S
+        BLO     __lc1
+        BHI     __lc2
+        CLRD
+        RTS
+__lc1   LDD     #-1
+        RTS
+__lc2   LDD     #1
+        RTS
+*===== ulcmp
+* compare unsigned Q with [2,S]: D = -1 / 0 / 1
+___ulcmp
+        CMPD    2,S
+        BLO     __uc1
+        BHI     __uc2
+        CMPW    4,S
+        BLO     __uc1
+        BHI     __uc2
+        CLRD
+        RTS
+__uc1   LDD     #-1
+        RTS
+__uc2   LDD     #1
+        RTS
+*===== setjmp
+* int setjmp(jmp_buf env)   env: U, S, PC
+_setjmp LDX     2,S
+        STU     ,X
+        STS     2,X
+        LDY     ,S
+        STY     4,X
+        CLRD
+        RTS
+*===== longjmp
+* void longjmp(jmp_buf env, int val)
+_longjmp
+        LDX     2,S
+        LDD     4,S
+        BNE     __lj1
+        LDD     #1
+__lj1   LDU     ,X
+        LDS     2,X
+        LEAS    2,S
+        JMP     [4,X]
+*===== bios
+************************************************************
+* BIOS calls (SWI2)                                        *
+* The BIOS switches RAM banks: the stack must be in the    *
+* common RAM ($0000-$1FFF) during a BIOS call. The C stack *
+* is in bank 0, so we use the stack of BASIC (__savesp).   *
+************************************************************
+* int __bios_putc(int c)  : output character via SWI2 PUTC
+___bios_putc
+        LDA     3,S
+        STS     __cstack
+        LDS     __savesp
+        LDB     #0
+        SWI2
+        LDS     __cstack
+        LDD     2,S
+        RTS
+* int __bios_getc(void)   : wait for a character via SWI2 GETC
+___bios_getc
+        STS     __cstack
+        LDS     __savesp
+__bg1   LDB     #1
+        SWI2
+        TSTB
+        BEQ     __bg1
+        LDS     __cstack
+        TFR     A,B
+        CLRA
+        RTS
+* int __bios_poll(void)   : -1 if no character available
+___bios_poll
+        STS     __cstack
+        LDS     __savesp
+        LDB     #1
+        SWI2
+        LDS     __cstack
+        TSTB
+        BEQ     __bp1
+        TFR     A,B
+        CLRA
+        RTS
+__bp1   LDD     #-1
+        RTS
+* int __bios(int fn, int d, int x): generic BIOS call, A = d >> 8, B = fn
+* returns D after the call, X is stored in __bios_x
+___bios LDX     6,S
+        LDD     4,S
+        TFR     B,A
+        LDB     3,S
+        STS     __cstack
+        LDS     __savesp
+        SWI2
+        LDS     __cstack
+        STX     ___bios_x
+        RTS
+___bios_x RMB   2
+__cstack RMB    2
+* unsigned long __jiffies(void) : 50 Hz counter of the BIOS
+___jiffies
+        ORCC    #$50
+        LDQ     >$0004
+        ANDCC   #$AF
+        RTS
